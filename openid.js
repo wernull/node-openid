@@ -22,28 +22,22 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  *
- * -*- Mode: JS; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- 
- * vim: set sw=2 ts=2 et tw=80 : 
+ * -*- Mode: JS; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+ * vim: set sw=2 ts=2 et tw=80 :
  */
 
 var convert = require('./lib/convert'),
     crypto = require('crypto'),
-    request = require('request'),
+    http = require('http'),
+    https = require('https'),
     querystring = require('querystring'),
     url = require('url'),
     xrds = require('./lib/xrds');
 
 var _associations = {};
 var _discoveries = {};
-var _nonces = {};
-
-var AX_MAX_VALUES_COUNT = 1000;
 
 var openid = exports;
-
-function hasOwnProperty(obj, prop) {
-  return Object.prototype.hasOwnProperty.call(obj, prop);
-}
 
 openid.RelyingParty = function(returnUrl, realm, stateless, strict, extensions)
 {
@@ -56,13 +50,13 @@ openid.RelyingParty = function(returnUrl, realm, stateless, strict, extensions)
 
 openid.RelyingParty.prototype.authenticate = function(identifier, immediate, callback)
 {
-  openid.authenticate(identifier, this.returnUrl, this.realm, 
+  openid.authenticate(identifier, this.returnUrl, this.realm,
       immediate, this.stateless, callback, this.extensions, this.strict);
 }
 
 openid.RelyingParty.prototype.verifyAssertion = function(requestOrUrl, callback)
 {
-  openid.verifyAssertion(requestOrUrl, this.returnUrl, callback, this.stateless, this.extensions, this.strict);
+  openid.verifyAssertion(requestOrUrl, callback, this.stateless, this.extensions, this.strict);
 }
 
 var _isDef = function(e)
@@ -154,7 +148,7 @@ var _buildUrl = function(theUrl, params)
     {
       for(var key in params)
       {
-        if(hasOwnProperty(params, key))
+        if(params.hasOwnProperty(key))
         {
           theUrl.query[key] = params[key];
         }
@@ -165,36 +159,178 @@ var _buildUrl = function(theUrl, params)
   return url.format(theUrl);
 }
 
-var _get = function (getUrl, params, callback, redirects) {
-  var options = {
-    url: getUrl,
-    maxRedirects: redirects || 5,
-    qs: params
-  };
-  request.get(options, function (error, response, body) {
-    if (error) {
-      callback(error);
-    } else {
-      callback(body, response.headers, response.statusCode);
-    }
-  });
-};
+var _proxyRequest = function(protocol, options)
+{
+  /*
+  If process.env['HTTP_PROXY_HOST'] and the env variable `HTTP_PROXY_POST`
+  are set, make sure path and the header Host are set to target url.
 
-var _post = function (postUrl, data, callback, redirects) {
-  var options = {
-    url: postUrl,
-    maxRedirects: redirects || 5,
-    form: data,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-  };
-  request.post(options, function (error, response, body) {
-    if (error) {
-      callback(error);
-    } else {
-      callback(body, response.headers, response.statusCode);
+  Similarly, `HTTPS_PROXY_HOST` and `HTTPS_PROXY_PORT` can be used
+  to proxy HTTPS traffic.
+
+  Proxies Example:
+      export HTTP_PROXY_HOST=localhost
+      export HTTP_PROXY_PORT=8080
+      export HTTPS_PROXY_HOST=localhost
+      export HTTPS_PROXY_PORT=8442
+
+  Function returns protocol which should be used for network request, one of
+  http: or https:
+  */
+  var targetHost = options.host;
+  var newProtocol = protocol;
+  if (!targetHost) return;
+  var updateOptions = function (envPrefix) {
+    var proxyHostname = process.env[envPrefix + '_PROXY_HOST'].trim();
+    var proxyPort = parseInt(process.env[envPrefix + '_PROXY_PORT'], 10);
+    if (proxyHostname.length > 0 && ! isNaN(proxyPort)) {
+
+      if (! options.headers) options.headers = {};
+
+      var targetHostAndPort = targetHost + ':' + options.port;
+
+      options.host = proxyHostname;
+      options.port = proxyPort;
+      options.path = protocol + '//' + targetHostAndPort + options.path;
+      options.headers['Host'] = targetHostAndPort;
     }
+  };
+  if ('https:' === protocol &&
+      !! process.env['HTTPS_PROXY_HOST'] &&
+      !! process.env['HTTPS_PROXY_PORT']) {
+    updateOptions('HTTPS');
+    // Proxy server request must be done via http... it is responsible for
+    // Making the https request...
+    newProtocol = 'http:';
+  } else if (!! process.env['HTTP_PROXY_HOST'] &&
+             !! process.env['HTTP_PROXY_PORT']) {
+    updateOptions('HTTP');
+  }
+  return newProtocol;
+}
+
+var _get = function(getUrl, params, callback, redirects)
+{
+  redirects = redirects || 5;
+  getUrl = url.parse(_buildUrl(getUrl, params));
+
+  var path = getUrl.pathname || '/';
+  if(getUrl.query)
+  {
+    path += '?' + getUrl.query;
+  }
+  var options =
+  {
+    host: getUrl.hostname,
+    port: _isDef(getUrl.port) ? parseInt(getUrl.port, 10) :
+      (getUrl.protocol == 'https:' ? 443 : 80),
+    path: path
+  };
+
+  var protocol = _proxyRequest(getUrl.protocol, options);
+
+  (protocol == 'https:' ? https : http).get(options, function(res)
+  {
+    var data = '';
+    res.on('data', function(chunk)
+    {
+      data += chunk;
+    });
+
+    var isDone = false;
+    var done = function()
+    {
+      if (isDone) return;
+      isDone = true;
+
+      if(res.headers.location && --redirects)
+      {
+        var redirectUrl = res.headers.location;
+        if(redirectUrl.indexOf('http') !== 0)
+        {
+          redirectUrl = getUrl.protocol + '//' + getUrl.hostname + ':' + options.port + (redirectUrl.indexOf('/') === 0 ? redirectUrl : '/' + redirectUrl);
+        }
+        _get(redirectUrl, params, callback, redirects);
+      }
+      else
+      {
+        callback(data, res.headers, res.statusCode);
+      }
+    }
+
+    res.on('end', function() { done(); });
+    res.on('close', function() { done(); });
+  }).on('error', function(error)
+  {
+    return callback(error);
   });
-};
+}
+
+var _post = function(postUrl, data, callback, redirects)
+{
+  redirects = redirects || 5;
+  postUrl = url.parse(postUrl);
+
+  var path = postUrl.pathname || '/';
+  if(postUrl.query)
+  {
+    path += '?' + postUrl.query;
+  }
+
+  var encodedData = _encodePostData(data);
+  var options =
+  {
+    host: postUrl.hostname,
+    path: path,
+    port: _isDef(postUrl.port) ? postUrl.port :
+      (postUrl.protocol == 'https:' ? 443 : 80),
+    headers:
+    {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': encodedData.length
+    },
+    method: 'POST'
+  };
+
+  var protocol = _proxyRequest(postUrl.protocol, options);
+
+  (protocol == 'https:' ? https : http).request(options, function(res)
+  {
+    var data = '';
+    res.on('data', function(chunk)
+    {
+      data += chunk;
+    });
+
+    var isDone = false;
+    var done = function()
+    {
+      if (isDone) return;
+      isDone = true;
+
+      if(res.headers.location && --redirects)
+      {
+        _post(res.headers.location, data, callback, redirects);
+      }
+      else
+      {
+        callback(data, res.headers, res.statusCode);
+      }
+    }
+
+    res.on('end', function() { done(); });
+    res.on('close', function() { done(); });
+  }).on('error', function(error)
+  {
+    return callback(error);
+  }).end(encodedData);
+}
+
+var _encodePostData = function(data)
+{
+  var encoded = querystring.stringify(data);
+  return encoded;
+}
 
 var _decodePostData = function(data)
 {
@@ -268,7 +404,7 @@ var _parseXrds = function(xrdsUrl, xrdsData)
     {
       provider.version = 'http://specs.openid.net/auth/2.0';
     }
-    else if(service.type == 'http://openid.net/signon/1.0' || 
+    else if(service.type == 'http://openid.net/signon/1.0' ||
       service.type == 'http://openid.net/signon/1.1')
     {
       provider.version = service.type;
@@ -338,37 +474,37 @@ var _parseHtml = function(htmlUrl, html, callback, hops)
     else
     {
       var localId = _matchLinkTag(html, 'openid.delegate');
-      callback([{ 
+      callback([{
         version: 'http://openid.net/signon/1.1',
-        endpoint: provider, 
+        endpoint: provider,
         claimedIdentifier: htmlUrl,
-        localIdentifier : localId 
+        localIdentifier : localId
       }]);
     }
   }
   else
   {
     var localId = _matchLinkTag(html, 'openid2.local_id');
-    callback([{ 
-      version: 'http://specs.openid.net/auth/2.0/signon', 
-      endpoint: provider, 
+    callback([{
+      version: 'http://specs.openid.net/auth/2.0/signon',
+      endpoint: provider,
       claimedIdentifier: htmlUrl,
-      localIdentifier : localId 
+      localIdentifier : localId
     }]);
   }
 }
 
 var _parseHostMeta = function(hostMeta, callback)
 {
-  var match = /^Link: <([^\n\r]+?)>;/.exec(hostMeta);
-  if (match != null && match.length > 0)
+  var match = /^Link: <([^\n\r]+)>;/.exec(hostMeta);
+  if(match != null)
   {
-    var xriUrl = match[1];
+    var xriUrl = match[0].slice(7,match.length - 4);
     _resolveXri(xriUrl, callback);
   }
   else
   {
-    callback(null);
+    callback(null)
   }
 }
 
@@ -460,7 +596,7 @@ var _resolveHostMeta = function(identifier, strict, callback, fallBackToProxy)
   var hostMetaUrl;
   if(fallBackToProxy && !strict)
   {
-    hostMetaUrl = 'https://www.google.com/accounts/o8/.well-known/host-meta?hd=' + host.host;
+    hostMetaUrl = 'https://www.google.com/accounts/o8/.well-known/host-meta?hd=' + host.host
   }
   else
   {
@@ -489,7 +625,7 @@ var _resolveHostMeta = function(identifier, strict, callback, fallBackToProxy)
         //the response to hostMetaUrl was some other http/html resource.
         //Therefore fallback to the proxy if no providers are found.
         _parseHostMeta(data, function(providers){
-          if((providers == null || providers.length == 0) && !fallBackToProxy && !strict) {
+          if((providers == null || providers.length == 0) && !fallBackToProxy && !strict){
             _resolveHostMeta(identifier, strict, callback, true);
           }
           else{
@@ -504,7 +640,7 @@ var _resolveHostMeta = function(identifier, strict, callback, fallBackToProxy)
 openid.discover = function(identifier, strict, callback)
 {
   identifier = _normalizeIdentifier(identifier);
-  if(!identifier) 
+  if(!identifier)
   {
     return callback({ message: 'Invalid identifier' }, null);
   }
@@ -535,12 +671,12 @@ openid.discover = function(identifier, strict, callback)
     else
     {
       // Add claimed identifier to providers with local identifiers
-      // and OpenID 1.0/1.1 providers to ensure correct resolution 
+      // and OpenID 1.0/1.1 providers to ensure correct resolution
       // of identities and services
       for(var i = 0, len = providers.length; i < len; ++i)
       {
         var provider = providers[i];
-        if(!provider.claimedIdentifier && 
+        if(!provider.claimedIdentifier &&
           (provider.localIdentifier || provider.version.indexOf('2.0') === -1))
         {
           provider.claimedIdentifier = identifier;
@@ -583,15 +719,15 @@ openid.associate = function(provider, callback, strict, algorithm)
   {
     if ((statusCode != 200 && statusCode != 400) || data === null)
     {
-      return callback({ 
-        message: 'HTTP request failed' 
-      }, { 
-        error: 'HTTP request failed', 
-        error_code: ''  + statusCode, 
-        ns: 'http://specs.openid.net/auth/2.0' 
+      return callback({
+        message: 'HTTP request failed'
+      }, {
+        error: 'HTTP request failed',
+        error_code: ''  + statusCode,
+        ns: 'http://specs.openid.net/auth/2.0'
       });
     }
-    
+
     data = _decodePostData(data);
 
     if(data.error_code == 'unsupported-type' || !_isDef(data.ns))
@@ -619,7 +755,7 @@ openid.associate = function(provider, callback, strict, algorithm)
           // HMAC-SHA1 has already been attempted with a blank session
           // type as per the OpenID 1.0/1.1 specification.
           // (See http://openid.net/specs/openid-authentication-1_1.html#mode_associate)
-          // However, providers like wordpress.com don't follow the 
+          // However, providers like wordpress.com don't follow the
           // standard and reject these requests, but accept OpenID 2.0
           // style requests without a session type, so we have to give
           // those a shot as well.
@@ -749,7 +885,7 @@ openid.authenticate = function(identifier, returnUrl, realm, immediate, stateles
         {
           var useLocalIdentifierAsKey = provider.version.indexOf('2.0') === -1 && provider.localIdentifier && provider.claimedIdentifier != provider.localIdentifier;
 
-          return openid.saveDiscoveredInformation(useLocalIdentifierAsKey ? provider.localIdentifier : provider.claimedIdentifier, 
+          return openid.saveDiscoveredInformation(useLocalIdentifierAsKey ? provider.localIdentifier : provider.claimedIdentifier,
             provider, function(error)
           {
             if(error)
@@ -776,7 +912,7 @@ openid.authenticate = function(identifier, returnUrl, realm, immediate, stateles
       var currentProvider = providers[providerIndex];
       if(stateless)
       {
-        _requestAuthentication(currentProvider, null, returnUrl, 
+        _requestAuthentication(currentProvider, null, returnUrl,
           realm, immediate, extensions || {}, chooseProvider);
       }
 
@@ -790,11 +926,11 @@ openid.authenticate = function(identifier, returnUrl, realm, immediate, stateles
           }
           else
           {
-            _requestAuthentication(currentProvider, answer.assoc_handle, returnUrl, 
+            _requestAuthentication(currentProvider, answer.assoc_handle, returnUrl,
               realm, immediate, extensions || {}, chooseProvider);
           }
         });
-        
+
       }
     })();
   });
@@ -813,7 +949,7 @@ var _requestAuthentication = function(provider, assoc_handle, returnUrl, realm, 
 
   for (var i in extensions)
   {
-    if(!hasOwnProperty(extensions, i))
+    if(!extensions.hasOwnProperty(i))
     {
       continue;
     }
@@ -821,7 +957,7 @@ var _requestAuthentication = function(provider, assoc_handle, returnUrl, realm, 
     var extension = extensions[i];
     for (var key in extension.requestParams)
     {
-      if (!hasOwnProperty(extension.requestParams, key)) { continue; }
+      if (!extension.requestParams.hasOwnProperty(key)) { continue; }
       params[key] = extension.requestParams[key];
     }
   }
@@ -876,21 +1012,21 @@ var _requestAuthentication = function(provider, assoc_handle, returnUrl, realm, 
   callback(null, _buildUrl(provider.endpoint, params));
 }
 
-openid.verifyAssertion = function(requestOrUrl, originalReturnUrl, callback, stateless, extensions, strict)
+openid.verifyAssertion = function(requestOrUrl, callback, stateless, extensions, strict)
 {
   extensions = extensions || {};
   var assertionUrl = requestOrUrl;
   if(typeof(requestOrUrl) !== typeof(''))
   {
-    if(requestOrUrl.method.toUpperCase() == 'POST') {
+    if(requestOrUrl.method == 'POST') {
       if((requestOrUrl.headers['content-type'] || '').toLowerCase().indexOf('application/x-www-form-urlencoded') === 0) {
         // POST response received
         var data = '';
-        
+
         requestOrUrl.on('data', function(chunk) {
           data += chunk;
         });
-        
+
         requestOrUrl.on('end', function() {
           var params = querystring.parse(data);
           return _verifyAssertionData(params, callback, stateless, extensions, strict);
@@ -899,10 +1035,10 @@ openid.verifyAssertion = function(requestOrUrl, originalReturnUrl, callback, sta
       else {
         return callback({ message: 'Invalid POST response from OpenID provider' });
       }
-      
+
       return; // Avoid falling through to GET method assertion
     }
-    else if(requestOrUrl.method.toUpperCase() != 'GET') {
+    else if(requestOrUrl.method != 'GET') {
       return callback({ message: 'Invalid request method from OpenID provider' });
     }
     assertionUrl = requestOrUrl.url;
@@ -911,42 +1047,7 @@ openid.verifyAssertion = function(requestOrUrl, originalReturnUrl, callback, sta
   assertionUrl = url.parse(assertionUrl, true);
   var params = assertionUrl.query;
 
-  if (!_verifyReturnUrl(assertionUrl, originalReturnUrl)) {
-      return callback({ message: 'Invalid return URL' });
-  }
   return _verifyAssertionData(params, callback, stateless, extensions, strict);
-}
-
-var _verifyReturnUrl = function (assertionUrl, originalReturnUrl) {
-  var receivedReturnUrl = assertionUrl.query['openid.return_to'];
-  if (!_isDef(receivedReturnUrl)) {
-    return false;
-  }
-
-  receivedReturnUrl = url.parse(receivedReturnUrl, true);
-  if (!receivedReturnUrl) {
-    return false;
-  }
-  originalReturnUrl = url.parse(originalReturnUrl, true);
-  if (!originalReturnUrl) {
-    return false;
-  }
-
-  if (originalReturnUrl.protocol !== receivedReturnUrl.protocol || // Verify scheme against original return URL
-      originalReturnUrl.host !== receivedReturnUrl.host || // Verify authority against original return URL
-      originalReturnUrl.pathname !== receivedReturnUrl.pathname) { // Verify path against current request URL
-    return false;
-  }
-
-  // Any query parameters that are present in the "openid.return_to" URL MUST also be present 
-  // with the same values in the URL of the HTTP request the RP received
-  for (var param in receivedReturnUrl.query) {
-    if (hasOwnProperty(receivedReturnUrl.query, param) && receivedReturnUrl.query[param] !== assertionUrl.query[param]) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 var _verifyAssertionData = function(params, callback, stateless, extensions, strict) {
@@ -960,10 +1061,7 @@ var _verifyAssertionData = function(params, callback, stateless, extensions, str
     return callback({ message: 'Unable to invalidate association handle'});
   }
 
-  if (!_checkNonce(params)) {
-      return callback({ message: 'Invalid or replayed nonce' });
-  }
-
+  // TODO: Check nonce if OpenID 2.0
   _verifyDiscoveredInformation(params, stateless, extensions, strict, function(error, result)
   {
     return callback(error, result);
@@ -999,52 +1097,6 @@ var _invalidateAssociationHandleIfRequested = function(params)
   return true;
 }
 
-var _checkNonce = function (params) {
-  if (!_isDef(params['openid.ns'])) {
-    return true; // OpenID 1.1 has no nonce
-  }
-  if (!_isDef(params['openid.response_nonce'])) {
-    return false;
-  }
-
-  var nonce = params['openid.response_nonce'];
-  var timestampEnd = nonce.indexOf('Z');
-  if (timestampEnd == -1) {
-    return false;
-  }
-
-  // Check for valid timestamp in nonce
-  var timestamp = new Date(Date.parse(nonce.substring(0, timestampEnd + 1)));
-  if (Object.prototype.toString.call(timestamp) !== '[object Date]' || isNaN(timestamp)) {
-    return false;
-  }
-    
-  // Remove old nonces from our store (nonces that are more skewed than 5 minutes)
-  _removeOldNonces();
-
-  // Check if nonce is skewed by more than 5 minutes
-  if (Math.abs(new Date().getTime() - timestamp.getTime()) > 300000) {
-    return false;
-  }
-
-  // Check if nonce is replayed
-  if (_isDef(_nonces[nonce])) {
-    return false;
-  }
-
-  // Store the nonce
-  _nonces[nonce] = timestamp;
-  return true;
-}
-
-var _removeOldNonces = function () {
-  for (var nonce in _nonces) {
-    if (hasOwnProperty(_nonces, nonce) && Math.abs(new Date().getTime() - _nonces[nonce].getTime()) > 300000) {
-      delete _nonces[nonce];
-    }
-  }
-}
-
 var _verifyDiscoveredInformation = function(params, stateless, extensions, strict, callback)
 {
   var claimedIdentifier = params['openid.claimed_id'];
@@ -1062,12 +1114,12 @@ var _verifyDiscoveredInformation = function(params, stateless, extensions, stric
       // OpenID 2.0+:
       // If there is no claimed identifier, then the
       // assertion is not about an identity
-      return callback(null, { authenticated: false }); 
+      return callback(null, { authenticated: false });
       }
   }
 
   if (useLocalIdentifierAsKey) {
-    claimedIdentifier = params['openid.identity'];  
+    claimedIdentifier = params['openid.identity'];
   }
 
   claimedIdentifier = _getCanonicalClaimedIdentifier(claimedIdentifier);
@@ -1085,7 +1137,7 @@ var _verifyDiscoveredInformation = function(params, stateless, extensions, stric
     else if (useLocalIdentifierAsKey) {
       return callback({ message: 'OpenID 1.0/1.1 response received, but no information has been discovered about the provider. It is likely that this is a fraudulent authentication response.' });
     }
-    
+
     openid.discover(claimedIdentifier, strict, function(error, providers)
     {
       if(error)
@@ -1115,7 +1167,7 @@ var _verifyAssertionAgainstProviders = function(providers, params, stateless, ex
     if(!!provider.version && provider.version.indexOf('2.0') !== -1)
     {
       var endpoint = params['openid.op_endpoint'];
-      if (provider.endpoint != endpoint) 
+      if (provider.endpoint != endpoint)
       {
         continue;
       }
@@ -1142,9 +1194,9 @@ var _verifyAssertionAgainstProviders = function(providers, params, stateless, ex
       {
         for(var ext in extensions)
         {
-          if (!hasOwnProperty(extensions, ext))
-          { 
-            continue; 
+          if (!extensions.hasOwnProperty(ext))
+          {
+            continue;
           }
           var instance = extensions[ext];
           instance.fillResult(params, result);
@@ -1196,7 +1248,7 @@ var _checkSignatureUsingAssociation = function(params, callback)
     {
       return callback({ message:'Association handle does not match provided endpoint' }, {authenticated: false});
     }
-    
+
     var message = '';
     var signedParams = params['openid.signed'].split(',');
     for(var i = 0; i < signedParams.length; i++)
@@ -1227,13 +1279,13 @@ var _checkSignatureUsingAssociation = function(params, callback)
 
 var _checkSignatureUsingProvider = function(params, provider, callback)
 {
-  var requestParams = 
+  var requestParams =
   {
     'openid.mode' : 'check_authentication'
   };
   for(var key in params)
   {
-    if(hasOwnProperty(params, key) && key != 'openid.mode')
+    if(params.hasOwnProperty(key) && key != 'openid.mode')
     {
       requestParams[key] = params[key];
     }
@@ -1277,24 +1329,24 @@ var _getCanonicalClaimedIdentifier = function(claimedIdentifier) {
 
 /* ==================================================================
  * Extensions
- * ================================================================== 
+ * ==================================================================
  */
 
-var _getExtensionAlias = function(params, ns) 
+var _getExtensionAlias = function(params, ns)
 {
   for (var k in params)
     if (params[k] == ns)
       return k.replace("openid.ns.", "");
 }
 
-/* 
+/*
  * Simple Registration Extension
  * http://openid.net/specs/openid-simple-registration-extension-1_1-01.html
  */
 
 var sreg_keys = ['nickname', 'email', 'fullname', 'dob', 'gender', 'postcode', 'country', 'language', 'timezone'];
 
-openid.SimpleRegistration = function SimpleRegistration(options) 
+openid.SimpleRegistration = function SimpleRegistration(options)
 {
   this.requestParams = {'openid.ns.sreg': 'http://openid.net/extensions/sreg/1.1'};
   if (options.policy_url)
@@ -1304,7 +1356,7 @@ openid.SimpleRegistration = function SimpleRegistration(options)
   for (var i = 0; i < sreg_keys.length; i++)
   {
     var key = sreg_keys[i];
-    if (options[key]) 
+    if (options[key])
     {
       if (options[key] == 'required')
       {
@@ -1339,11 +1391,11 @@ openid.SimpleRegistration.prototype.fillResult = function(params, result)
   }
 };
 
-/* 
+/*
  * User Interface Extension
- * http://svn.openid.net/repos/specifications/user_interface/1.0/trunk/openid-user-interface-extension-1_0.html 
+ * http://svn.openid.net/repos/specifications/user_interface/1.0/trunk/openid-user-interface-extension-1_0.html
  */
-openid.UserInterface = function UserInterface(options) 
+openid.UserInterface = function UserInterface(options)
 {
   if (typeof(options) != 'object')
   {
@@ -1351,7 +1403,7 @@ openid.UserInterface = function UserInterface(options)
   }
 
   this.requestParams = {'openid.ns.ui': 'http://specs.openid.net/extensions/ui/1.0'};
-  for (var k in options) 
+  for (var k in options)
   {
     this.requestParams['openid.ui.' + k] = options[k];
   }
@@ -1362,15 +1414,16 @@ openid.UserInterface.prototype.fillResult = function(params, result)
   // TODO: Fill results
 }
 
-/* 
+/*
  * Attribute Exchange Extension
- * http://openid.net/specs/openid-attribute-exchange-1_0.html 
+ * http://openid.net/specs/openid-attribute-exchange-1_0.html
  * Also see:
- *  - http://www.axschema.org/types/ 
+ *  - http://www.axschema.org/types/
  *  - http://code.google.com/intl/en-US/apis/accounts/docs/OpenID.html#Parameters
  */
+// TODO: count handling
 
-var attributeMapping = 
+var attributeMapping =
 {
     'http://axschema.org/contact/country/home': 'country'
   , 'http://axschema.org/contact/email': 'email'
@@ -1382,15 +1435,15 @@ var attributeMapping =
   , 'http://axschema.org/namePerson': 'fullname'
 };
 
-openid.AttributeExchange = function AttributeExchange(options) 
-{ 
+openid.AttributeExchange = function AttributeExchange(options)
+{
   this.requestParams = {'openid.ns.ax': 'http://openid.net/srv/ax/1.0',
     'openid.ax.mode' : 'fetch_request'};
   var required = [];
   var optional = [];
   for (var ns in options)
   {
-    if (!hasOwnProperty(options, ns)) { continue; }
+    if (!options.hasOwnProperty(ns)) { continue; }
     if (options[ns] == 'required')
     {
       required.push(ns);
@@ -1401,7 +1454,7 @@ openid.AttributeExchange = function AttributeExchange(options)
     }
   }
   var self = this;
-  required = required.map(function(ns, i) 
+  required = required.map(function(ns, i)
   {
     var attr = attributeMapping[ns] || 'req' + i;
     self.requestParams['openid.ax.type.' + attr] = ns;
@@ -1426,13 +1479,12 @@ openid.AttributeExchange = function AttributeExchange(options)
 openid.AttributeExchange.prototype.fillResult = function(params, result)
 {
   var extension = _getExtensionAlias(params, 'http://openid.net/srv/ax/1.0') || 'ax';
-  var regex = new RegExp('^openid\\.' + extension + '\\.(value|type|count)\\.(\\w+)(\\.(\\d+)){0,1}$');
+  var regex = new RegExp('^openid\\.' + extension + '\\.(value|type)\\.(\\w+)$');
   var aliases = {};
-  var counters = {};
   var values = {};
   for (var k in params)
   {
-    if (!hasOwnProperty(params, k)) { continue; }
+    if (!params.hasOwnProperty(k)) { continue; }
     var matches = k.match(regex);
     if (!matches)
     {
@@ -1442,40 +1494,12 @@ openid.AttributeExchange.prototype.fillResult = function(params, result)
     {
       aliases[params[k]] = matches[2];
     }
-    else if (matches[1] == 'count')
-    {
-      //counter sanitization
-      var count = parseInt(params[k], 10);
-
-      // values number limitation (potential attack by overflow ?)
-      counters[matches[2]] = (count < AX_MAX_VALUES_COUNT) ? count : AX_MAX_VALUES_COUNT ;
-    }
     else
     {
-      if (matches[3])
-      {
-        //matches multi-value, aka "count" aliases
-
-        //counter sanitization
-        var count = parseInt(matches[4], 10);
-
-        // "in bounds" verification
-        if (count > 0 && count <= (counters[matches[2]] || AX_MAX_VALUES_COUNT))
-        {
-          if (!values[matches[2]]) {
-            values[matches[2]] = [];
-          }
-          values[matches[2]][count-1] = params[k];
-        }
-      }
-      else
-      {
-        //matches single-value aliases
-        values[matches[2]] = params[k];
-      }
+      values[matches[2]] = params[k];
     }
   }
-  for (var ns in aliases) 
+  for (var ns in aliases)
   {
     if (aliases[ns] in values)
     {
@@ -1497,18 +1521,18 @@ openid.OAuthHybrid.prototype.fillResult = function(params, result)
 {
   var extension = _getExtensionAlias(params, 'http://specs.openid.net/extensions/oauth/1.0') || 'oauth'
     , token_attr = 'openid.' + extension + '.request_token';
-  
-  
+
+
   if(params[token_attr] !== undefined)
   {
     result['request_token'] = params[token_attr];
   }
 };
 
-/* 
+/*
  * Provider Authentication Policy Extension (PAPE)
  * http://openid.net/specs/openid-provider-authentication-policy-extension-1_0.html
- * 
+ *
  * Note that this extension does not validate that the provider is obeying the
  * authentication request, it only allows the request to be made.
  *
@@ -1522,19 +1546,19 @@ openid.OAuthHybrid.prototype.fillResult = function(params, result)
 var pape_request_keys = ['max_auth_age', 'preferred_auth_policies', 'preferred_auth_level_types' ];
 var pape_response_keys = ['auth_policies', 'auth_time']
 
-/* Some short-hand mappings for auth_policies */ 
-var papePolicyNameMap = 
+/* Some short-hand mappings for auth_policies */
+var papePolicyNameMap =
 {
     'phishing-resistant': 'http://schemas.openid.net/pape/policies/2007/06/phishing-resistant',
     'multi-factor': 'http://schemas.openid.net/pape/policies/2007/06/multi-factor',
     'multi-factor-physical': 'http://schemas.openid.net/pape/policies/2007/06/multi-factor-physical',
     'none' : 'http://schemas.openid.net/pape/policies/2007/06/none'
 }
- 
-openid.PAPE = function PAPE(options) 
+
+openid.PAPE = function PAPE(options)
 {
   this.requestParams = {'openid.ns.pape': 'http://specs.openid.net/extensions/pape/1.0'};
-  for (var k in options) 
+  for (var k in options)
   {
     if (k === 'preferred_auth_policies') {
       this.requestParams['openid.pape.' + k] = _getLongPolicyName(options[k]);
@@ -1546,10 +1570,10 @@ openid.PAPE = function PAPE(options)
 };
 
 /* you can express multiple pape 'preferred_auth_policies', so replace each
- * with the full policy URI as per papePolicyNameMapping. 
+ * with the full policy URI as per papePolicyNameMapping.
  */
 var _getLongPolicyName = function(policyNames) {
-  var policies = policyNames.split(' ');   
+  var policies = policyNames.split(' ');
   for (var i=0; i<policies.length; i++) {
     if (policies[i] in papePolicyNameMap) {
       policies[i] = papePolicyNameMap[policies[i]];
@@ -1559,7 +1583,7 @@ var _getLongPolicyName = function(policyNames) {
 }
 
 var _getShortPolicyName = function(policyNames) {
-  var policies = policyNames.split(' ');   
+  var policies = policyNames.split(' ');
   for (var i=0; i<policies.length; i++) {
     for (shortName in papePolicyNameMap) {
       if (papePolicyNameMap[shortName] === policies[i]) {
@@ -1576,7 +1600,7 @@ openid.PAPE.prototype.fillResult = function(params, result)
   var paramString = 'openid.' + extension + '.';
   var thisParam;
   for (var p in params) {
-    if (hasOwnProperty(params, p)) {
+    if (params.hasOwnProperty(p)) {
       if (p.substr(0, paramString.length) === paramString) {
         thisParam = p.substr(paramString.length);
         if (thisParam === 'auth_policies') {
@@ -1586,5 +1610,5 @@ openid.PAPE.prototype.fillResult = function(params, result)
         }
       }
     }
-  } 
+  }
 }
