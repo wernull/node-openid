@@ -169,8 +169,7 @@ var _get = function (getUrl, params, callback, redirects) {
   var options = {
     url: getUrl,
     maxRedirects: redirects || 5,
-    qs: params,
-    headers: { 'Accept' : 'application/xrds+xml,text/html,text/plain,*/*' }
+    qs: params
   };
   request.get(options, function (error, response, body) {
     if (error) {
